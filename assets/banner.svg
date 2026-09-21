@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="240" viewBox="0 0 600 240">
+  <rect width="600" height="240" fill="#0A0A0A" rx="16"/>
+
+  <!-- Logo (hex shield, centered) -->
+  <g transform="translate(250, 30)">
+    <path d="M50 0 L90 23 L90 77 L50 100 L10 77 L10 23 Z"
+          fill="none" stroke="#C4522A" stroke-width="5" stroke-linejoin="round"/>
+    <path d="M28 70 L28 30 L37 30 L50 50 L63 30 L72 30 L72 70 L64 70 L64 40 L54 56 L46 56 L36 40 L36 70 Z"
+          fill="#F2EDE8"/>
+    <line x1="28" y1="78" x2="72" y2="78" stroke="#D97A55" stroke-width="3" stroke-linecap="round"/>
+  </g>
+
+  <!-- MOSRAI (centered) -->
+  <text x="300" y="180" font-family="'JetBrains Mono', ui-monospace, Menlo, monospace"
+        font-size="44" font-weight="700" fill="#F2EDE8" letter-spacing="6"
+        text-anchor="middle">MOSRAI</text>
+
+  <!-- Full name (centered, tight) -->
+  <text x="300" y="210" font-family="'JetBrains Mono', ui-monospace, Menlo, monospace"
+        font-size="14" fill="#9A9390" text-anchor="middle">Mobile Offensive Security Research AI Agent</text>
+</svg>

@@ -1,0 +1,48 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Local-only provenance denylist (never shipped)
+tools/provenance-denylist.local.txt
+
+# Secretos / datos de instancia
+.env
+.env.*
+*.pem
+*.p12
+*.keystore
+*_creds*
+
+# Artefactos de engagement (PII de cliente — nunca commitear)
+enabling.lock
+engagement.state
+findings/
+evidence/
+LEDGER.md
+
+# Excepción: las plantillas del repo sí se publican
+!templates/LEDGER.md
+
+# Salidas de validación (se regeneran)
+validation-report.md
+
+# Binarios
+*.apk
+*.aab
+*.ipa
+*.dex
+*.so
+*.dylib
+*.zip
+*.tar.gz
+*.burp
+*.har
+
+# Python / Node
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+dist/
+build/

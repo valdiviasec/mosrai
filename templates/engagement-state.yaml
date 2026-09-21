@@ -1,0 +1,116 @@
+# engagement.state: persistent engagement state
+# Created by: mosrai init_engagement / MCP mosrai.init_engagement
+# Lives in: <engagement_dir>/engagement.state
+# Format: YAML (human-readable, git-diffable)
+# Rule: append-only for telemetry and findings; mutable for phase/enabling
+
+app:
+  name: ""                    # human-readable app name
+  package: ""                 # com.example.app
+  file: ""                    # target.apk or target.ipa
+  platform: ""                # android | ios
+  stack: ""                   # native | flutter | react-native | capacitor | xamarin | unknown
+  version: ""                 # app version from manifest/plist
+
+scope:
+  type: ""                    # full | partial | retest-only
+  inclusions: []              # endpoints/components explicitly in scope
+  exclusions: []              # endpoints/components explicitly out of scope
+  notes: ""                   # free-form scope notes from client
+
+phase: "init"                 # init | intake | resources | testing | first-cut | review | chain | retest | closed
+started: ""                   # ISO 8601 timestamp
+updated: ""                   # ISO 8601 timestamp, updated on every state change
+
+models:                       # operator plane (the harness driving the engagement)
+  heavy: ""                   # deep reasoning model, e.g. "glm-5.2". "" if undecided
+  soft: ""                    # mechanical/high-volume model, e.g. "deepseek-v4.1-flash"
+  per_phase: {}               # optional overrides: {enabling: soft, chain: heavy, ...}
+  # Target plane (a model the audited app ships with) is recorded per finding, not here.
+
+resources:                    # cycle Step 3: what the requester provided
+  intake_tier: ""             # gray-box | white-box
+  context_pack: ""            # path to filled context-pack.md
+  traffic_capture: ""         # path to Burp/Caido project export
+  source: ""                  # path to source bundle, or ""
+  credentials_ref: ""         # where credentials live (never inline secrets)
+
+capabilities:                 # filled by mosrai preflight
+  device_connected: false
+  root_jailbreak: false
+  proxy_configured: false
+  frida_server: false
+  tools:                      # from TOOLCHAIN.lock check
+    jadx: ""                  # version or "missing"
+    apktool: ""
+    blutter: ""
+    hermes_dec: ""
+    frida_tools: ""
+
+enabling:
+  status: "pending"           # pending | active | failed | skipped
+  root_bypass: ""             # script/method that worked, or "not-needed"
+  ssl_bypass: ""              # script/method that worked
+  proxy_verified: false       # traffic confirmed flowing through Burp/Caido
+  lock_file: ""               # path to enabling.lock (replay-deterministic)
+  notes: ""
+
+surfaces_tested: []           # list of tested attack surfaces
+  # - name: "login endpoint"
+  #   category: "auth"
+  #   tested_at: "2026-08-31T14:00:00Z"
+  #   result: "finding FIND-001"
+
+findings:
+  count: 0
+  first_cut_count: 0          # findings produced by the harness before human review (cycle Step 5)
+  items: []                   # summary only. full findings in findings/FIND-NNN.md
+    # - id: "FIND-001"
+    #   title: "IDOR in user profile"
+    #   severity: "high"
+    #   category: "auth"
+    #   status: "confirmed"   # first-cut | confirmed | reported | disputed
+    #   operator_decision: "path-built"   # pending | accepted | discarded | path-built
+    #   maswe: "MASWE-0029"   # or "n/a"
+    #   chain: "CHAIN-001"    # or ""
+    #   created: "2026-08-31T14:30:00Z"
+
+journal:
+  entries: []                 # operator journal entry IDs, append-only
+    # - id: "2026-09-15-001"
+    #   finding: "FIND-001"
+    #   map_category: 4       # Human-Required Map category 1-7
+    #   file: "journal/2026-09-15-001.md"
+
+chains:
+  count: 0
+  items: []
+    # - id: "CHAIN-001"
+    #   status: "confirmed"
+    #   findings: ["FIND-001", "FIND-005"]
+
+retest:
+  current_round: 0            # 0 = no retest yet
+  rounds: []
+    # - round: 1
+    #   started: "2026-09-15T10:00:00Z"
+    #   scope: "all-open"
+    #   artifact_sha256: ""    # hash of the APK/IPA tested this round
+    #   checklist: "retest/round-1/CHECKLIST.md"
+    #   verdicts: 0            # count of verdicts entered this round
+
+telemetry:
+  sessions: []
+    # - id: "2026-08-31-001"
+    #   phase: "enabling"
+    #   model: "claude-opus-4.8"
+    #   harness: "claude-code"
+    #   tokens_in: 42000
+    #   tokens_out: 8500
+    #   cost_usd: 1.87
+    #   duration_min: 12
+    #   findings_created: 0
+    #   skills_loaded: ["flutter-ssl-bypass-patternscan", "packer-rehook-tick"]
+  total_cost_usd: 0.0
+  total_findings: 0
+  total_sessions: 0

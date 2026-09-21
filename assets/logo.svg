@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!-- MOSRAI logo: hexagonal shield with M, Valdivia palette -->
+  <rect width="512" height="512" rx="64" fill="#0A0A0A"/>
+
+  <!-- Hexagonal shield shape -->
+  <path d="M256 64 L416 144 L416 368 L256 448 L96 368 L96 144 Z"
+        fill="none" stroke="#C4522A" stroke-width="12" stroke-linejoin="round"/>
+
+  <!-- Inner hex accent -->
+  <path d="M256 96 L384 160 L384 352 L256 416 L128 352 L128 160 Z"
+        fill="none" stroke="#8B3A1E" stroke-width="4" stroke-linejoin="round" opacity="0.6"/>
+
+  <!-- Letter M -->
+  <path d="M176 336 L176 176 L216 176 L256 248 L296 176 L336 176 L336 336 L304 336 L304 224 L276 288 L236 288 L208 224 L208 336 Z"
+        fill="#F2EDE8"/>
+
+  <!-- Bottom accent line (human judgment) -->
+  <line x1="176" y1="368" x2="336" y2="368" stroke="#D97A55" stroke-width="8" stroke-linecap="round"/>
+</svg>

@@ -1,0 +1,39 @@
+# MOSRAI Confidentiality Gate: reviewed allowlist
+#
+# One literal signature per line. Matching is exact (case-insensitive; trailing
+# punctuation ignored). A match is suppressed ONLY when its raw text equals an
+# entry below. Every other match keeps the gate fail-closed.
+#
+# Review rules:
+#   - Only technical signatures that are known-safe in ANY context belong here.
+#   - Never add client names, real credentials, or engagement identifiers.
+#   - Custom deny patterns (--conf) are never suppressed.
+#   - Audit with `mosrai-scrub check <path> --strict` to see every match.
+#
+# Last reviewed: 2026-09
+
+# Android emulator loopback aliases (standard, non-secret)
+10.0.2.2
+10.0.2.15
+10.0.3.2
+10.0.3.15
+
+# Documentation prose that is not a credential
+Bearer token
+bearer tokens
+bearer bound
+bearer de
+
+# PEM marker used as a memory-scan pattern. A real leaked key still trips
+# HIGH_ENTROPY on its base64 body, so suppressing the marker is safe.
+-----BEGIN RSA PRIVATE KEY-----
+
+# Placeholder / example endpoints
+support@company.com
+nokey@localhost.run
+
+# Byte-table fragment (offset +16) misdetected as a phone number
++16 37 62 59 72
+# Code snippets in skills that look like credentials but are crypto test vectors
+password = pt[:-pad].decode()
+secret = bytes(d ^ k for d, k in zip(data, key))

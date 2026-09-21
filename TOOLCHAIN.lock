@@ -1,0 +1,27 @@
+# TOOLCHAIN.lock: pinned tool versions for MOSRAI
+# Checked by: mosrai preflight / MCP mosrai.preflight
+# Rule: if a tool version doesn't match, preflight WARNS (not blocks).
+#       If a tool is MISSING, preflight FAILS.
+
+[tools]
+jadx = "1.5.1"
+apktool = "2.10.0"
+frida-tools = "12.5.1"
+blutter = "2.7.0"
+hermes-dec = "0.4.0"
+
+[tools.optional]
+radare2 = "5.9.6"
+ghidra = "11.2"
+mobsf = "4.1.2"
+class-dump = "3.5"
+
+[host]
+adb = "*"              # any version, must be present
+ideviceinstaller = "*" # any version, iOS only
+python3 = ">=3.10"
+
+[notes]
+# To update: change version here, run `mosrai setup` to install/upgrade.
+# Docker users: versions are pinned in the Dockerfile, this file is informational.
+# Native users: `mosrai setup` reads this file and installs via brew/pip/cargo.

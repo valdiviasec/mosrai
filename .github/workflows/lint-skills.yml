@@ -1,0 +1,38 @@
+name: Lint Skills
+
+on:
+  push:
+    paths:
+      - 'skills/**'
+      - 'tools/lint.py'
+  pull_request:
+    paths:
+      - 'skills/**'
+      - 'tools/lint.py'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Run skill linter
+        run: python3 tools/lint.py
+
+      - name: Verify skills have no third-party origin references
+        run: python3 tools/provenance-lint.py
+
+      - name: Verify SKILL_INDEX.txt is up to date
+        run: |
+          python3 tools/build_index.py
+          if ! git diff --exit-code SKILL_INDEX.txt; then
+            echo "SKILL_INDEX.txt is out of date. Run: python3 tools/build_index.py"
+            exit 1
+          fi

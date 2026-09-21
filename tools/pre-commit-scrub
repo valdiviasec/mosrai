@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# MOSRAI pre-commit hook: blocks commits containing PII/credentials.
+# Install: cp tools/pre-commit-scrub .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+# Or symlink: ln -s ../../tools/pre-commit-scrub .git/hooks/pre-commit
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+SCRUB="$REPO_ROOT/mosrai"
+
+if [ ! -f "$SCRUB" ]; then
+    echo "[mosrai-scrub] ERROR: scrub script not found at $SCRUB"
+    exit 1
+fi
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+
+if [ -z "$STAGED" ]; then
+    exit 0
+fi
+
+FAILED=0
+
+for file in $STAGED; do
+    filepath="$REPO_ROOT/$file"
+    # skip binary files and the scrub script itself
+    if file "$filepath" | grep -q "binary\|executable"; then
+        continue
+    fi
+    # skip skill definitions (they shouldn't have PII but are full of security terms)
+    if [[ "$file" == skills/*/SKILL.md ]]; then
+        continue
+    fi
+    if ! python3 "$SCRUB" check "$filepath" --json >/dev/null 2>&1; then
+        echo "[mosrai-scrub] BLOCKED: $file contains potential PII/credentials"
+        python3 "$SCRUB" check "$filepath" 2>&1 | grep -E "FAIL|MATCH" || true
+        FAILED=1
+    fi
+done
+
+if [ "$FAILED" -eq 1 ]; then
+    echo ""
+    echo "[mosrai-scrub] Commit blocked. Scrub flagged files before committing."
+    echo "  Run: python3 mosrai check <file> for details."
+    exit 1
+fi
+
+exit 0

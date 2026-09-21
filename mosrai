@@ -1,0 +1,1451 @@
+#!/usr/bin/env python3
+"""MOSRAI unified CLI: Mobile Offensive Security Research AI Agent.
+
+Commands:
+  init      scaffold an engagement
+  start     launch the harness
+  status    engagement snapshot
+  report    consolidate and distribute
+  journal   log a human intervention
+  chain     confirm a kill chain
+  retest    generate a retest checklist
+  ledger    record a verdict
+  scrub     confidentiality gate
+  validate  self-test
+  lint      check skills
+  index     rebuild SKILL_INDEX
+  new       scaffold a skill
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+SCRIPT = Path(__file__).resolve()
+REPO = SCRIPT.parent
+PYTHON = sys.executable
+
+
+def _resolve_allowlist() -> Path:
+    for p in [REPO / 'tools' / 'allowlist.txt', REPO / 'engine' / 'allowlist.txt']:
+        if p.is_file():
+            return p
+    return REPO / 'tools' / 'allowlist.txt'
+
+
+ALLOWLIST_PATH = _resolve_allowlist()
+
+# ---------------------------------------------------------------------------
+# Cycle constants
+# ---------------------------------------------------------------------------
+
+VERDICTS = (
+    'MITIGATED', 'PARTIAL', 'PERSISTS', 'PENDING',
+    'NOT VERIFIABLE', 'RISK ACCEPTED',
+)
+VERDICTS_CANONICAL = {v.replace(' ', '_'): v for v in VERDICTS}
+VERDICT_ALIASES = {
+    'MITIGATED': 'MITIGATED', 'FIXED': 'MITIGATED',
+    'PARTIAL': 'PARTIAL',
+    'PERSISTS': 'PERSISTS', 'NOT-FIXED': 'PERSISTS', 'NOT_FIXED': 'PERSISTS',
+    'PENDING': 'PENDING',
+    'NOT VERIFIABLE': 'NOT VERIFIABLE', 'NOT_VERIFIABLE': 'NOT VERIFIABLE',
+    'RISK ACCEPTED': 'RISK ACCEPTED', 'RISK_ACCEPTED': 'RISK ACCEPTED',
+    'DEFERRED': 'RISK ACCEPTED',
+    'REGRESSED': 'PERSISTS',
+}
+PHASES = ('init', 'intake', 'resources', 'testing', 'first-cut',
+          'review', 'chain', 'retest', 'closed')
+MAP_CATEGORIES = {
+    1: 'Physical-world actuation',
+    2: 'Ground-truth verification',
+    3: 'Hypothesis selection',
+    4: 'Adaptation under drift',
+    5: 'Calibrated abstention',
+    6: 'Ethical restraint',
+    7: 'Impact truth',
+}
+DIRS = ('intake', 'sources', 'traffic', 'findings', 'evidence',
+        'journal', 'chains', 'retest')
+
+# ---------------------------------------------------------------------------
+# Detection regexes
+# ---------------------------------------------------------------------------
+
+RE_EMAIL = re.compile(
+    r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}',
+)
+
+RE_PHONE = re.compile(
+    r'(?<!\d)'
+    r'(?:'
+    r'\+(?:56|593|57|52|54|51|55|1|44)'
+    r'[\s\-.]?\d[\d\s\-\.]{6,14}\d'
+    r'|'
+    r'\(\d{1,4}\)[\s\-.]?\d[\d\s\-\.]{5,12}\d'
+    r')'
+    r'(?!\d)',
+)
+
+RE_RUT = re.compile(
+    r'\b\d{1,2}\.\d{3}\.\d{3}-[\dkK]\b'
+    r'|\b\d{7,8}-[\dkK]\b',
+)
+RE_CEDULA = re.compile(
+    r'(?:c[eé]dula|cedula|c\.?c\.?|c\.?i\.?|dni|documento)'
+    r'[\s:=#\-]*\d{6,10}\b',
+    re.IGNORECASE,
+)
+RE_PASSPORT = re.compile(
+    r'(?:passport|pasaporte)[\s:=#\-]*[A-Z]{1,2}\d{5,9}\b',
+    re.IGNORECASE,
+)
+
+RE_CREDENTIAL = re.compile(
+    r'(?:'
+    r'(?:password|passwd|pwd|secret|api_key|apikey|api[-_]?secret'
+    r'|access_key|private_key|client_secret|auth_token'
+    r'|db_password|database_password)'
+    r'\s*[=:]\s*["\']?.{4,}'
+    r'|AWS_ACCESS_KEY(?:_ID)?\s*[=:]\s*\S+'
+    r'|AWS_SECRET(?:_ACCESS_KEY)?\s*[=:]\s*\S+'
+    r'|AKIA[0-9A-Z]{16}'
+    r'|-----BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY-----'
+    r'|Bearer\s+[A-Za-z0-9\-._~+/]+=*'
+    r'|ghp_[A-Za-z0-9]{36}'
+    r'|glpat-[A-Za-z0-9\-]{20}'
+    r'|sk-[A-Za-z0-9]{20,}'
+    r')',
+    re.IGNORECASE,
+)
+
+RE_INTERNAL = re.compile(
+    r'(?:'
+    r'[a-zA-Z0-9\-]+\.internal\.[a-zA-Z0-9.\-]+'
+    r'|[a-zA-Z0-9\-]+\.corp\.[a-zA-Z0-9.\-]+'
+    r'|[a-zA-Z0-9\-]+\.local\b'
+    r'|\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'
+    r'|\b192\.168\.\d{1,3}\.\d{1,3}\b'
+    r'|\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b'
+    r')',
+)
+
+_FP_PREFIXES = (
+    'http://', 'https://', 'ftp://', 'file://',
+    '/', './', '../',
+)
+_FP_HEX_HASH = re.compile(r'^[0-9a-fA-F]{32,128}$')
+_FP_PUBLIC_DOMAINS = re.compile(
+    r'https?://(?:www\.)?'
+    r'(?:github\.com|gitlab\.com|stackoverflow\.com|google\.com'
+    r'|npmjs\.com|pypi\.org|maven\.org|rubygems\.org'
+    r'|docker\.io|hub\.docker\.com|amazonaws\.com'
+    r'|cloudflare\.com|cdn\.jsdelivr\.net)',
+)
+_RE_HIGH_ENTROPY_CANDIDATE = re.compile(
+    r'(?:(?<=["\':=\s,])|(?<=^))([A-Za-z0-9+/=_\-]{21,})(?=["\'\s,;)\]}]|$)',
+)
+
+# Redaction regexes (for cmd_report)
+_RE_BEARER = re.compile(r'Bearer\s+[A-Za-z0-9\-._~+/]+=*')
+_RE_REDACT_KEY = re.compile(
+    r'(?i)(?:password|passwd|pwd|secret|api_key|apikey)\s*[=:]\s*["\']?.{4,}',
+)
+_RE_PRIVATE_IP = re.compile(
+    r'\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}'
+    r'|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b',
+)
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def fail(msg: str) -> int:
+    print(f'ERROR: {msg}', file=sys.stderr)
+    return 1
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def today() -> str:
+    return datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def run(cmd, cwd=None):
+    """Run a command, return (rc, stdout, stderr)."""
+    proc = subprocess.run(
+        cmd, cwd=cwd or REPO, capture_output=True, text=True, timeout=600,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def load_state(path: Path):
+    """Minimal YAML-subset parser for the state file (no pyyaml)."""
+    if not path.is_file():
+        return None
+    state = {}
+    for line in path.read_text().splitlines():
+        m = re.match(r'^\s*(\w+):\s*"?([^"#]*)"?\s*(?:#.*)?$', line)
+        if m:
+            state[m.group(1)] = m.group(2).strip()
+    return state
+
+
+def set_state_scalar(path: Path, key: str, value: str) -> None:
+    text = path.read_text()
+    pattern = re.compile(rf'^{re.escape(key)}:\s*"?[^"\n#]*"?', re.M)
+    if pattern.search(text):
+        text = pattern.sub(f'{key}: "{value}"', text, count=1)
+    else:
+        text = text.rstrip('\n') + f'\n{key}: "{value}"\n'
+    path.write_text(text)
+
+
+def next_number(prefix: str, directory: Path, pattern: str) -> int:
+    highest = 0
+    if directory.is_dir():
+        for f in directory.iterdir():
+            m = re.match(pattern, f.name)
+            if m:
+                highest = max(highest, int(m.group(1)))
+    return highest + 1
+
+
+# ---------------------------------------------------------------------------
+# Scrub helpers
+# ---------------------------------------------------------------------------
+
+def _shannon_entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    length = len(s)
+    counts = Counter(s)
+    return -sum(
+        (c / length) * math.log2(c / length) for c in counts.values()
+    )
+
+
+def _is_entropy_false_positive(token: str) -> bool:
+    for prefix in _FP_PREFIXES:
+        if token.startswith(prefix):
+            return True
+    if _FP_PUBLIC_DOMAINS.match(token):
+        return True
+    if _FP_HEX_HASH.match(token):
+        return True
+    if token.endswith('==') and len(token) < 24:
+        return True
+    return False
+
+
+def _normalize_signature(s: str) -> str:
+    return s.strip().rstrip('.,;:').casefold()
+
+
+def _load_allowlist(path: Path | None = None) -> set:
+    p = path if path is not None else ALLOWLIST_PATH
+    entries = set()
+    if not p.is_file():
+        return entries
+    try:
+        with open(p, 'r', encoding='utf-8', errors='replace') as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                entries.add(_normalize_signature(line))
+    except OSError as exc:
+        print(f'Warning: cannot read allowlist {p}: {exc}', file=sys.stderr)
+    return entries
+
+
+def _is_binary(path: Path) -> bool:
+    try:
+        with open(path, 'rb') as f:
+            chunk = f.read(1024)
+        return b'\x00' in chunk
+    except OSError:
+        return True
+
+
+def _load_custom_patterns(conf_path: str | None) -> list:
+    if conf_path is None:
+        return []
+    p = Path(conf_path)
+    if not p.is_file():
+        print(f'Warning: config file not found: {conf_path}', file=sys.stderr)
+        return []
+    patterns = []
+    with open(p, 'r', encoding='utf-8', errors='replace') as f:
+        for i, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith('#'):
+                continue
+            try:
+                patterns.append(re.compile(line))
+            except re.error as exc:
+                print(
+                    f'Warning: invalid regex on line {i} of {conf_path}: {exc}',
+                    file=sys.stderr,
+                )
+    return patterns
+
+
+# ---------------------------------------------------------------------------
+# Scrub scanner
+# ---------------------------------------------------------------------------
+
+class Finding:
+    __slots__ = ('line_num', 'category', 'excerpt')
+
+    def __init__(self, line_num: int, category: str, excerpt: str):
+        self.line_num = line_num
+        self.category = category
+        self.excerpt = excerpt
+
+    def as_dict(self) -> dict:
+        return {
+            'line': self.line_num,
+            'category': self.category,
+            'excerpt': self.excerpt,
+        }
+
+    def as_text(self) -> str:
+        return f'  Line {self.line_num}: [{self.category}] {self.excerpt}'
+
+
+def _scan_line(line: str, line_num: int, custom_patterns: list,
+               allowlist: set, stats: dict) -> list:
+    findings = []
+
+    def keep(category: str, raw: str, excerpt: str | None = None) -> None:
+        if _normalize_signature(raw) in allowlist:
+            stats['suppressed'] += 1
+            return
+        findings.append(Finding(line_num, category,
+                                 raw if excerpt is None else excerpt))
+
+    for m in RE_EMAIL.finditer(line):
+        keep('EMAIL', m.group())
+    for m in RE_PHONE.finditer(line):
+        keep('PHONE', m.group().strip())
+    for m in RE_RUT.finditer(line):
+        keep('GOV_ID_RUT', m.group())
+    for m in RE_CEDULA.finditer(line):
+        keep('GOV_ID_CEDULA', m.group(), _truncate(m.group()))
+    for m in RE_PASSPORT.finditer(line):
+        keep('GOV_ID_PASSPORT', m.group(), _truncate(m.group()))
+    for m in RE_CREDENTIAL.finditer(line):
+        keep('CREDENTIAL', m.group(), _truncate(m.group()))
+    for m in _RE_HIGH_ENTROPY_CANDIDATE.finditer(line):
+        token = m.group(1)
+        if _is_entropy_false_positive(token):
+            continue
+        entropy = _shannon_entropy(token)
+        if entropy > 4.5:
+            keep('HIGH_ENTROPY', token,
+                 f'{_truncate(token)} (entropy: {entropy:.1f} bits/char)')
+    for m in RE_INTERNAL.finditer(line):
+        keep('INTERNAL_HOST', m.group())
+    for idx, pat in enumerate(custom_patterns):
+        for m in pat.finditer(line):
+            findings.append(Finding(
+                line_num,
+                'CUSTOM',
+                _truncate(m.group()),
+            ))
+    return findings
+
+
+def scan_file(path: Path, custom_patterns: list, allowlist: set, stats: dict) -> list:
+    try:
+        if path.resolve() == ALLOWLIST_PATH.resolve():
+            return []
+    except OSError:
+        pass
+    if _is_binary(path):
+        return []
+    findings = []
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            for line_num, line in enumerate(f, start=1):
+                findings.extend(
+                    _scan_line(line, line_num, custom_patterns,
+                               allowlist, stats)
+                )
+    except OSError as exc:
+        findings.append(Finding(0, 'SCAN_ERROR', str(exc)))
+    return findings
+
+
+def scan_target(target: Path, custom_patterns: list,
+                allowlist: set, stats: dict) -> dict:
+    results = {}
+    if target.is_file():
+        findings = scan_file(target, custom_patterns, allowlist, stats)
+        if findings:
+            results[str(target)] = findings
+    elif target.is_dir():
+        for root, dirs, files in os.walk(target):
+            dirs[:] = [d for d in dirs if d != '.git']
+            for fname in sorted(files):
+                fpath = Path(root) / fname
+                findings = scan_file(fpath, custom_patterns, allowlist, stats)
+                if findings:
+                    results[str(fpath)] = findings
+    else:
+        results[str(target)] = [
+            Finding(0, 'SCAN_ERROR', f'Target not found: {target}')
+        ]
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Scrub output
+# ---------------------------------------------------------------------------
+
+def _truncate(s: str, max_len: int = 60) -> str:
+    if len(s) <= max_len:
+        return s
+    return s[:max_len - 3] + '...'
+
+
+def _format_text(target: str, results: dict, suppressed: int = 0) -> str:
+    lines = ['=== MOSRAI Confidentiality Gate ===', f'Scanning: {target}', '']
+    total = sum(len(v) for v in results.values())
+    if suppressed:
+        lines.append(
+            f'Allowlist: {suppressed} known-safe match'
+            f'{"es" if suppressed != 1 else ""} suppressed '
+            f'({ALLOWLIST_PATH.name}).'
+        )
+        lines.append('')
+    if total == 0:
+        lines.append('CLEAN: no matches found.')
+        lines.append('')
+        lines.append('Result: PASS')
+        return '\n'.join(lines)
+    lines.append(f'BLOCKED: {total} match{"es" if total != 1 else ""} found:')
+    lines.append('')
+    for filepath, findings in sorted(results.items()):
+        if len(results) > 1:
+            lines.append(f'  --- {filepath} ---')
+        for f in findings:
+            lines.append(f.as_text())
+    lines.append('')
+    lines.append(f'Result: FAIL ({total} match{"es" if total != 1 else ""})')
+    lines.append('This file MUST be scrubbed before publishing.')
+    return '\n'.join(lines)
+
+
+def _format_json(target: str, results: dict, suppressed: int = 0) -> str:
+    total = sum(len(v) for v in results.values())
+    output = {
+        'target': target,
+        'result': 'FAIL' if total > 0 else 'PASS',
+        'total_matches': total,
+        'suppressed_matches': suppressed,
+        'files': {
+            fp: [f.as_dict() for f in findings]
+            for fp, findings in sorted(results.items())
+        },
+    }
+    return json.dumps(output, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Validate helpers
+# ---------------------------------------------------------------------------
+
+def _publishable_files():
+    """Files git would ship (tracked + untracked, minus ignored)."""
+    code, out, err = run(['git', 'ls-files', '-co', '--exclude-standard'])
+    if code == 0 and out.strip():
+        files = [REPO / line for line in out.splitlines() if line.strip()]
+    else:
+        files = [p for p in REPO.rglob('*') if p.is_file()]
+    return [f for f in files if f.name != 'validation-report.md']
+
+
+def _scrub_summary(out: str) -> str:
+    for line in out.splitlines():
+        if line.startswith('Result:'):
+            return line.strip()
+    return out.splitlines()[-1].strip() if out.splitlines() else 'no output'
+
+
+def _lint_cmd():
+    for p in [REPO / 'tools' / 'lint.py']:
+        if p.is_file():
+            return [PYTHON, str(p)]
+    return None
+
+
+def _index_cmd():
+    for p in [REPO / 'tools' / 'build_index.py']:
+        if p.is_file():
+            return [PYTHON, str(p)]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_init(args) -> int:
+    root = Path(args.dir)
+    root.mkdir(parents=True, exist_ok=True)
+    for d in DIRS:
+        (root / d).mkdir(exist_ok=True)
+
+    state_file = root / 'engagement.state'
+    if not state_file.exists():
+        template = REPO / 'templates' / 'engagement-state.yaml'
+        if template.is_file():
+            state_file.write_text(template.read_text())
+        else:
+            state_file.write_text('app: {}\n')
+        print(f'created {state_file}')
+
+    ledger = root / 'LEDGER.md'
+    if not ledger.exists():
+        template = REPO / 'templates' / 'LEDGER.md'
+        ledger.write_text(template.read_text() if template.is_file() else '# Retest Ledger\n')
+        print(f'created {ledger}')
+
+    fresh = load_state(state_file) is None
+    existing_phase = None
+    if state_file.is_file():
+        m = re.search(r'^phase:\s*"?([^"\n#]*)"?', state_file.read_text(), re.M)
+        if m:
+            existing_phase = m.group(1).strip()
+
+    updates = {
+        'app_name': args.app or '',
+        'package': args.package or '',
+        'platform': args.platform or '',
+        'stack': args.stack or '',
+        'started': now_iso(),
+        'updated': now_iso(),
+    }
+    for key, value in updates.items():
+        if value:
+            set_state_scalar(state_file, key, value)
+    if fresh or not existing_phase or existing_phase == '""':
+        set_state_scalar(state_file, 'phase', 'intake')
+
+    if args.heavy or args.soft:
+        state_text = state_file.read_text()
+        if args.heavy:
+            state_text = re.sub(r'^(\s*heavy:).*$', rf'\1 "{args.heavy}"', state_text, flags=re.M)
+        if args.soft:
+            state_text = re.sub(r'^(\s*soft:).*$', rf'\1 "{args.soft}"', state_text, flags=re.M)
+        state_file.write_text(state_text)
+    if args.intake_tier:
+        state_text = state_file.read_text()
+        state_text = re.sub(r'^(\s*intake_tier:).*$', rf'\1 "{args.intake_tier}"', state_text, flags=re.M)
+        state_file.write_text(state_text)
+
+    if args.artifact:
+        artifact = Path(args.artifact)
+        if not artifact.is_file():
+            return fail(f'artifact not found: {artifact}')
+        digest = sha256_file(artifact)
+        intake_dir = root / 'intake'
+        intake_dir.mkdir(exist_ok=True)
+        dest = intake_dir / artifact.name
+        shutil.copy2(artifact, dest)
+        print(f'artifact: {dest}')
+        print(f'artifact sha256: {digest}')
+        set_state_scalar(state_file, 'artifact_sha256', digest)
+        if args.platform == '' and artifact.suffix.lower() in ('.apk', '.ipa'):
+            set_state_scalar(state_file, 'platform',
+                             'android' if artifact.suffix.lower() == '.apk' else 'ios')
+
+    print(f'engagement ready: {root}')
+    missing = [d for d in DIRS if not (root / d).is_dir()]
+    if missing:
+        print(f'warning: missing dirs: {missing}')
+    return 0
+
+
+def cmd_status(args) -> int:
+    root = Path(args.dir)
+    state_file = root / 'engagement.state'
+    state = load_state(state_file) if state_file.is_file() else {}
+    findings = list((root / 'findings').glob('FIND-*.md')) if (root / 'findings').is_dir() else []
+    journal = list((root / 'journal').glob('*.md')) if (root / 'journal').is_dir() else []
+    chains = list((root / 'chains').glob('CHAIN-*.md')) if (root / 'chains').is_dir() else []
+    rounds = sorted((root / 'retest').glob('round-*')) if (root / 'retest').is_dir() else []
+
+    print(f'=== MOSRAI engagement: {root.name} ===')
+    for key in ('app_name', 'package', 'platform', 'stack', 'phase',
+                'heavy', 'soft', 'intake_tier', 'artifact_sha256'):
+        value = state.get(key)
+        if value:
+            print(f'{key:16} {value}')
+    print(f'{"findings":16} {len(findings)}')
+    print(f'{"journal entries":16} {len(journal)}')
+    print(f'{"chains":16} {len(chains)}')
+    print(f'{"retest rounds":16} {len(rounds)}')
+
+    gaps = []
+    phase = state.get('phase', 'init')
+    if not state.get('heavy') and not state.get('soft'):
+        gaps.append('models not declared (cycle Step 2)')
+    if state.get('intake_tier') == 'white-box' and not (root / 'context-pack.md').is_file():
+        gaps.append('white-box intake without context-pack.md (cycle Step 3)')
+    if phase in ('review', 'chain') and not journal:
+        gaps.append('no operator journal entries before chain phase (cycle Steps 6-7)')
+    if phase == 'chain' and not chains:
+        gaps.append('phase=chain but no chain files (cycle Step 8)')
+    if any(v in ('PERSISTS', 'PARTIAL', 'PENDING') for f in findings
+           for v in [f.read_text()]) and not rounds:
+        gaps.append('open verdicts without a retest round (cycle Step 9)')
+    if gaps:
+        print('gaps:')
+        for g in gaps:
+            print(f'  - {g}')
+    else:
+        print('gaps: none')
+    return 0
+
+
+def cmd_journal(args) -> int:
+    root = Path(args.dir)
+    jdir = root / 'journal'
+    if not root.is_dir():
+        return fail(f'engagement dir not found: {root}')
+    jdir.mkdir(exist_ok=True)
+    n = next_number('journal', jdir, r'^\d{4}-\d{2}-\d{2}-(\d{3})\.md$')
+    entry_id = f'{today()}-{n:03d}'
+    target = jdir / f'{entry_id}.md'
+
+    template = REPO / 'templates' / 'operator-journal.md'
+    body = template.read_text() if template.is_file() else '# Operator Journal\n'
+    body = body.replace('{YYYY-MM-DD}-{NNN}', entry_id)
+    body = body.replace('{ISO 8601}', now_iso())
+    if args.finding:
+        body = body.replace('{FIND-NNN, or "none yet"}', args.finding)
+    if args.phase:
+        body = body.replace('{enabling / recon / traffic / hunting / chain / retest}', args.phase)
+    if args.title:
+        body = body.replace('# Operator Journal', f'# {args.title}', 1)
+    body = body.replace(
+        '{1-7, see below}',
+        f'{args.category}: {MAP_CATEGORIES.get(args.category, "?")}',
+    )
+    target.write_text(body)
+
+    state_file = root / 'engagement.state'
+    if state_file.is_file():
+        text = state_file.read_text()
+        if re.search(r'^journal:\s*$', text, re.M):
+            text = re.sub(
+                r'(^journal:\s*$\n(?:.*\n)*?\s*entries:\s*)\[\]',
+                rf'\1\n    # - id: "{entry_id}"\n    #   finding: "{args.finding or ""}"\n    #   map_category: {args.category}\n    #   file: "journal/{entry_id}.md"',
+                text, count=1, flags=re.M,
+            )
+        state_file.write_text(text)
+
+    print(f'journal entry: {target}')
+    print(f'category {args.category}: {MAP_CATEGORIES.get(args.category, "?")}')
+    return 0
+
+
+def cmd_chain(args) -> int:
+    root = Path(args.dir)
+    cdir = root / 'chains'
+    if not root.is_dir():
+        return fail(f'engagement dir not found: {root}')
+    cdir.mkdir(exist_ok=True)
+    n = next_number('chain', cdir, r'^CHAIN-(\d+)\.md$')
+    chain_id = f'CHAIN-{n:03d}'
+    target = cdir / f'{chain_id}.md'
+
+    template = REPO / 'templates' / 'CHAIN.md'
+    body = template.read_text() if template.is_file() else '# CHAIN\n'
+    body = body.replace('CHAIN-{NNN}', chain_id)
+    if args.title:
+        body = body.replace('{title}', args.title, 1)
+    if args.severity:
+        body = body.replace('{critical / high / medium / low}', args.severity, 1)
+    if args.findings:
+        body = body.replace('{FIND-NNN, FIND-NNN, ...}', args.findings, 1)
+    target.write_text(body)
+    print(f'chain file: {target}')
+    return 0
+
+
+def cmd_checklist(args) -> int:
+    root = Path(args.dir)
+    ledger = root / 'LEDGER.md'
+    if not ledger.is_file():
+        return fail(f'LEDGER.md not found: {ledger}')
+    round_dir = root / 'retest' / f'round-{args.round}'
+    round_dir.mkdir(parents=True, exist_ok=True)
+    target = round_dir / 'CHECKLIST.md'
+
+    artifact_line = ''
+    if args.artifact:
+        artifact = Path(args.artifact)
+        if artifact.is_file():
+            artifact_line = f'**Artifact SHA-256:** `{sha256_file(artifact)}`'
+        else:
+            main_artifact = root / 'intake' / artifact.name
+            if main_artifact.is_file():
+                artifact_line = f'**Artifact SHA-256:** `{sha256_file(main_artifact)}`'
+
+    rows = []
+    for line in ledger.read_text().splitlines():
+        if not line.startswith('| FIND-'):
+            continue
+        cells = [c.strip() for c in line.strip('|').split('|')]
+        if len(cells) < 3:
+            continue
+        rows.append(cells)
+    if not rows:
+        rows = [['{FIND-NNN}', '{sev}', '{verdict}', '', '', '', '']]
+
+    checklist = [
+        f'# Retest Checklist: Round {args.round}',
+        '',
+        f'**Date:** {now_iso()}  ',
+        f'**Scope:** {args.scope or "all-open"}  ',
+        artifact_line,
+        '',
+        'Verdicts (canonical six): MITIGATED / PARTIAL / PERSISTS / PENDING / NOT VERIFIABLE / RISK ACCEPTED.',
+        'Record each verdict with: `mosrai ledger . --finding FIND-NNN --round '
+        + str(args.round) + ' --verdict VERDICT`.',
+        '',
+    ]
+    for cells in rows:
+        finding = cells[0]
+        checklist += [
+            f'## {finding}',
+            '',
+            f'- [ ] Replay original reproduction (baseline behavior before any fix)',
+            f'- [ ] Confirm expected-fixed vs expected-persists behavior',
+            f'- [ ] Execute the fix check and capture evidence -> `evidence/round-{args.round}/{finding}/`',
+            f'- [ ] Human-only steps completed (physical device / MFA / go-no-go), or N/A',
+            f'- [ ] Verdict recorded in `LEDGER.md` with MASWE mapping and artifact hash',
+            '',
+        ]
+    target.write_text('\n'.join(checklist))
+    print(f'checklist: {target}')
+    print(f'open findings: {len(rows)}')
+    return 0
+
+
+def _parse_ledger_header(line):
+    """Return (round_start_col, notes_col, n_cols) from a ledger header row."""
+    if not line.startswith('|'):
+        return None
+    headers = [c.strip() for c in line.strip('|').split('|')]
+    round_cols = [i for i, h in enumerate(headers) if re.fullmatch(r'R\d+', h)]
+    if not round_cols:
+        return None
+    first_round = round_cols[0]
+    notes_col = headers.index('Notes') if 'Notes' in headers else len(headers) - 1
+    return first_round, notes_col, len(headers)
+
+
+def _append_round_column(lines, header_idx, notes_col):
+    """Extend a legacy header and its data rows with the next round column."""
+    headers = [c.strip() for c in lines[header_idx].strip('|').split('|')]
+    rounds = [int(h[1:]) for h in headers if re.fullmatch(r'R\d+', h)]
+    new_round = max(rounds) + 1 if rounds else 1
+    headers.insert(notes_col, f'R{new_round}')
+    lines[header_idx] = '| ' + ' | '.join(headers) + ' |'
+    if header_idx + 1 < len(lines) and re.fullmatch(r'\|[\s\-:|]+\|', lines[header_idx + 1]):
+        sep = ['---'] * len(headers)
+        lines[header_idx + 1] = '| ' + ' | '.join(sep) + ' |'
+    for i in range(header_idx + 2, len(lines)):
+        if not lines[i].startswith('|'):
+            break
+        cells = [c.strip() for c in lines[i].strip('|').split('|')]
+        if len(cells) < len(headers):
+            while len(cells) < len(headers) - 1:
+                cells.insert(notes_col, '')
+        lines[i] = '| ' + ' | '.join(cells) + ' |'
+    return new_round
+
+
+def cmd_ledger(args) -> int:
+    root = Path(args.dir)
+    ledger = root / 'LEDGER.md'
+    if not ledger.is_file():
+        return fail(f'LEDGER.md not found: {ledger}')
+
+    normalized = args.verdict.strip().upper().replace('_', ' ')
+    canonical = VERDICT_ALIASES.get(normalized) or VERDICTS_CANONICAL.get(normalized)
+    if canonical is None:
+        return fail(
+            'invalid verdict {!r}; use one of: {}'.format(args.verdict, ', '.join(VERDICTS))
+        )
+
+    text = ledger.read_text()
+    lines = text.splitlines()
+    header_idx = None
+    parsed = None
+    for i, line in enumerate(lines):
+        if line.startswith('| Finding') and 'R1' in line:
+            parsed = _parse_ledger_header(line)
+            if parsed:
+                header_idx = i
+                break
+    if header_idx is None or parsed is None:
+        return fail('LEDGER.md has no verdict table header')
+
+    first_round_col, notes_col, n_cols = parsed
+
+    round_numbers = [
+        int(c) for c in
+        [x.strip()[1:] for x in lines[header_idx].strip('|').split('|') if re.fullmatch(r'R\d+', x.strip())]
+    ]
+    if args.round not in round_numbers:
+        while max(round_numbers, default=0) < args.round:
+            new_round = _append_round_column(lines, header_idx, notes_col)
+            round_numbers.append(new_round)
+        first_round_col, notes_col, n_cols = _parse_ledger_header(lines[header_idx])
+
+    finding = args.finding.upper()
+    found = False
+    for i in range(header_idx + 2, len(lines)):
+        line = lines[i]
+        if not line.startswith('|'):
+            break
+        cells = [c.strip() for c in line.strip('|').split('|')]
+        if not cells or cells[0].upper() != finding:
+            continue
+        while len(cells) < n_cols:
+            cells.insert(notes_col, '')
+        if first_round_col >= 3:
+            if args.sev and cells[1] in ('', '{sev}', '?'):
+                cells[1] = args.sev
+            if args.maswe and len(cells) > 2 and cells[2].startswith('{'):
+                cells[2] = args.maswe
+        round_col = round_numbers.index(args.round) + first_round_col
+        cells[round_col] = canonical
+        if args.note:
+            cells[notes_col] = args.note
+        lines[i] = '| ' + ' | '.join(cells) + ' |'
+        found = True
+        break
+    if not found:
+        cells = [finding, args.sev or '?', args.maswe or ''] if n_cols >= 3 else [finding, args.sev or '?']
+        notes_placeholder = args.note or ''
+        while len(cells) < n_cols:
+            if len(cells) == n_cols - 1:
+                cells.append(notes_placeholder)
+            else:
+                cells.append('')
+        round_col = round_numbers.index(args.round) + first_round_col
+        cells[round_col] = canonical
+        insert_at = header_idx + 2
+        while insert_at < len(lines) and lines[insert_at].startswith('|'):
+            insert_at += 1
+        lines.insert(insert_at, '| ' + ' | '.join(cells) + ' |')
+
+    ledger.write_text('\n'.join(lines) + '\n')
+
+    state_file = root / 'engagement.state'
+    if state_file.is_file():
+        state_text = state_file.read_text()
+        state_text = re.sub(
+            r'^(retest:\s*$\n(?:\s*.*\n)*?\s*current_round:\s*)\d+',
+            rf'\g<1>{args.round}', state_text, count=1, flags=re.M,
+        )
+        set_state_scalar(state_file, 'updated', now_iso())
+        state_file.write_text(state_text)
+
+    print(f'{finding} round {args.round}: {canonical}')
+    return 0
+
+
+def cmd_scrub(args) -> int:
+    try:
+        target = Path(args.target)
+        custom_patterns = _load_custom_patterns(args.conf)
+        allowlist = set() if args.strict else _load_allowlist()
+        stats = {'suppressed': 0}
+        results = scan_target(target, custom_patterns, allowlist, stats)
+        total = sum(len(v) for v in results.values())
+
+        if args.json_output:
+            print(_format_json(str(target), results, stats['suppressed']))
+        else:
+            print(_format_text(str(target), results, stats['suppressed']))
+
+        return 1 if total > 0 else 0
+    except Exception as exc:
+        print(f'FATAL: {exc}', file=sys.stderr)
+        return 1
+
+
+def cmd_start(args) -> int:
+    root = Path(args.dir)
+    state_file = root / 'engagement.state'
+    state = load_state(state_file) if state_file.is_file() else {}
+
+    def _chk(cmd, timeout=5):
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            return proc.returncode == 0, proc.stdout.strip()
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return False, ''
+
+    device_ok, _ = _chk(['adb', 'devices'])
+    ollama_ok, ollama_out = _chk(['ollama', 'list'])
+    proxy_ok, _ = _chk(['lsof', '-i', ':8080'])
+    backend_ok, _ = _chk(['curl', '-s', '-o', '/dev/null', 'http://localhost:5050'])
+
+    model = state.get('soft') or state.get('heavy') or 'unknown'
+
+    index = REPO / 'SKILL_INDEX.txt'
+    n_skills = 0
+    if index.is_file():
+        n_skills = sum(1 for line in index.read_text().splitlines()
+                       if line.strip() and not line.startswith('#'))
+
+    print(f'harness: opencode')
+    print(f'model: {model}')
+    print(f'skills: {n_skills}')
+    print()
+    print(f'device (adb): {"ok" if device_ok else "not found"}')
+    ollama_models = len(ollama_out.splitlines()) - 1 if ollama_ok and ollama_out else 0
+    print(f'ollama: {"ok (" + str(ollama_models) + " models)" if ollama_ok else "not found"}')
+    print(f'proxy (8080): {"ok" if proxy_ok else "not found"}')
+    print(f'backend (5050): {"ok" if backend_ok else "not found"}')
+    print()
+    print(f'next: cd {root} && opencode')
+    return 0
+
+
+def _redact_text(text: str) -> str:
+    text = RE_EMAIL.sub('<email>', text)
+    text = _RE_BEARER.sub('<token>', text)
+    text = _RE_REDACT_KEY.sub('<redacted>', text)
+
+    def _ip_repl(m):
+        if m.group() == '10.0.2.2':
+            return m.group()
+        return '<host_ip>'
+
+    text = _RE_PRIVATE_IP.sub(_ip_repl, text)
+    return text
+
+
+
+def cmd_matrix(args) -> int:
+    root = Path(args.dir)
+    if not root.is_dir():
+        return fail(f'engagement dir not found: {root}')
+    target = root / 'attack-surface-matrix.md'
+    if target.is_file():
+        print(f'matrix already exists: {target}')
+        print('edit it or delete it to regenerate')
+        return 0
+    mosrai_root = Path(__file__).resolve().parent
+    template = mosrai_root / 'templates' / 'attack-surface-matrix.md'
+    if not template.is_file():
+        return fail(f'template not found: {template}')
+    target.write_text(template.read_text())
+    print(f'matrix scaffolded: {target}')
+    print('next: fill the matrix from the traffic capture and context pack')
+    print('     then have the operator approve before hunting starts')
+    return 0
+
+
+def cmd_report(args) -> int:
+    root = Path(args.dir)
+    if not root.is_dir():
+        return fail(f'engagement dir not found: {root}')
+
+    allowlist = _load_allowlist()
+    stats = {'suppressed': 0}
+    results = scan_target(root, [], allowlist, stats)
+    total = sum(len(v) for v in results.values())
+
+    findings = list((root / 'findings').glob('FIND-*.md')) if (root / 'findings').is_dir() else []
+    chains = list((root / 'chains').glob('CHAIN-*.md')) if (root / 'chains').is_dir() else []
+    ledger_rows = 0
+    ledger = root / 'LEDGER.md'
+    if ledger.is_file():
+        for line in ledger.read_text().splitlines():
+            if line.startswith('| FIND-'):
+                ledger_rows += 1
+
+    if total == 0:
+        print(f'scrub: PASS ({root})')
+        print(f'findings: {len(findings)} | chains: {len(chains)} | ledger: {ledger_rows} rows')
+        print('no redaction needed')
+        return 0
+
+    dist_dir = root / 'dist'
+    dist_dir.mkdir(exist_ok=True)
+
+    for name in ['findings', 'chains', 'journal']:
+        src = root / name
+        if src.is_dir():
+            dest = dist_dir / name
+            if dest.is_dir():
+                shutil.rmtree(dest)
+            shutil.copytree(src, dest)
+    for name in ['LEDGER.md', 'context-pack.md']:
+        src = root / name
+        if src.is_file():
+            shutil.copy2(src, dist_dir / name)
+
+    for fpath in dist_dir.rglob('*'):
+        if fpath.is_file() and not _is_binary(fpath):
+            try:
+                text = fpath.read_text(errors='replace')
+                text = _redact_text(text)
+                fpath.write_text(text)
+            except OSError:
+                pass
+
+    stats2 = {'suppressed': 0}
+    results2 = scan_target(dist_dir, [], allowlist, stats2)
+    total2 = sum(len(v) for v in results2.values())
+
+    if total2 == 0:
+        print(f'scrub: FAIL ({root}) -> PASS (dist/)')
+        print(f'findings: {len(findings)} | chains: {len(chains)} | ledger: {ledger_rows} rows')
+        print(f'dist/ ready for distribution ({dist_dir})')
+        return 0
+    else:
+        print(f'scrub: FAIL ({root}) -> FAIL (dist/): {total2} matches remain')
+        print(f'findings: {len(findings)} | chains: {len(chains)} | ledger: {ledger_rows} rows')
+        print(f'dist/ needs manual review ({dist_dir})')
+        return 1
+
+
+_DEFAULT_SKILL_TEMPLATE = """\
+---
+name: {slug}
+description: Use when ...
+category: vectors-misc
+platform: android
+tier: 1
+related: []
+---
+
+# {slug}
+
+## Objective
+
+TODO
+
+## Steps
+
+1. TODO
+
+## Evidence
+
+TODO
+"""
+
+
+def cmd_new(args) -> int:
+    slug = args.slug
+    skill_dir = REPO / 'skills' / slug
+    if skill_dir.exists():
+        return fail(f'skill already exists: {skill_dir}')
+    skill_dir.mkdir(parents=True)
+
+    template = REPO / 'templates' / 'SKILL.md'
+    if template.is_file():
+        body = template.read_text()
+    else:
+        body = _DEFAULT_SKILL_TEMPLATE
+
+    body = body.replace('{slug}', slug)
+    (skill_dir / 'SKILL.md').write_text(body)
+
+    print(f'skill: {skill_dir / "SKILL.md"}')
+    print('edit SKILL.md to fill in frontmatter and content')
+    return 0
+
+
+def cmd_lint(args) -> int:
+    cmd = _lint_cmd()
+    if cmd is None:
+        return fail('lint script not found')
+    if args.json_output:
+        cmd.append('--json')
+    if args.fix:
+        cmd.append('--fix')
+    code, out, err = run(cmd)
+    print(out)
+    if err:
+        print(err, file=sys.stderr)
+    return code
+
+
+def cmd_index(args) -> int:
+    cmd = _index_cmd()
+    if cmd is None:
+        return fail('index script not found')
+    code, out, err = run(cmd)
+    print(out)
+    if err:
+        print(err, file=sys.stderr)
+    return code
+
+
+# ---------------------------------------------------------------------------
+# Validate checks
+# ---------------------------------------------------------------------------
+
+def check_lint():
+    cmd = _lint_cmd()
+    if cmd is None:
+        return False, 'lint script not found'
+    code, out, err = run(cmd)
+    failures = None
+    m = re.search(r'Failed:\s*(\d+)', out)
+    if m:
+        failures = int(m.group(1))
+    ok = code == 0 and failures == 0
+    return ok, f'lint_skills.py: {failures} failures' if failures is not None else out[-300:]
+
+
+def check_index():
+    before = (REPO / 'SKILL_INDEX.txt').read_text()
+    cmd = _index_cmd()
+    if cmd is None:
+        return False, 'index script not found'
+    code, out, err = run(cmd)
+    after = (REPO / 'SKILL_INDEX.txt').read_text()
+    ok = code == 0 and before == after
+    return ok, 'SKILL_INDEX.txt up to date' if ok else 'SKILL_INDEX.txt out of date'
+
+
+def check_scrub():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp) / 'publishable'
+        tmpdir.mkdir()
+        for i, src in enumerate(_publishable_files()):
+            if not src.is_file():
+                continue
+            link = tmpdir / f'f{i:05d}-{src.name}'
+            try:
+                link.symlink_to(src.resolve())
+            except OSError:
+                shutil.copy2(src, link)
+        code, out, err = run([PYTHON, str(SCRIPT), 'scrub', str(tmpdir)])
+    ok = code == 0 and 'Result: PASS' in out
+    if ok:
+        return True, 'gate PASS on publishable files'
+    return False, _scrub_summary(out)
+
+
+def check_scrub_controls():
+    with tempfile.TemporaryDirectory() as tmp:
+        fake_domain = 'gmail' + '.com'
+        email = 'juan' + '.perez' + '@' + fake_domain
+        rut = '1' + '2.' + '34' + '5.678-9'
+        key_prefix = 's' + 'k-'
+        key_body = '1a2b3c4d' + '5e6f7g8h' + '9i0j1k2l' + '3m4n5o6p'
+        key_value = key_prefix + key_body
+        pii = Path(tmp) / 'pii.txt'
+        pii.write_text(
+            'mail: ' + email + '\n'
+            'rut: ' + rut + '\n'
+            'ap' + 'i_' + 'key=' + key_value + '\n'
+        )
+        deny = Path(tmp) / 'deny.txt'
+        client_name = 'ACME' + '-CLIENT-X'
+        deny.write_text(client_name + '\n')
+        content = Path(tmp) / 'client.txt'
+        content.write_text('project for ' + client_name + '\n')
+
+        code_pii, _, _ = run([PYTHON, str(SCRIPT), 'scrub', str(pii)])
+        code_deny, _, _ = run([PYTHON, str(SCRIPT), 'scrub', str(content), '--conf', str(deny)])
+        verdicts = (code_pii == 1, code_deny == 1)
+        ok = all(verdicts)
+        detail = f'PII blocked={verdicts[0]} deny-rule blocked={verdicts[1]}'
+        return ok, detail
+
+
+def check_cycle():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / 'e2e'
+        steps = [
+            ([PYTHON, str(SCRIPT), 'init', str(root),
+              '--app', 'Validate', '--platform', 'android',
+              '--heavy', 'glm-5.2', '--soft', 'deepseek-v4.1-flash'], None),
+            ([PYTHON, str(SCRIPT), 'journal', str(root),
+              '--category', '2', '--finding', 'FIND-001'], None),
+            ([PYTHON, str(SCRIPT), 'chain', str(root),
+              '--title', 'validate chain', '--findings', 'FIND-001'], None),
+            ([PYTHON, str(SCRIPT), 'retest', str(root),
+              '--round', '1'], None),
+            ([PYTHON, str(SCRIPT), 'ledger', str(root),
+              '--finding', 'FIND-001', '--round', '1',
+              '--verdict', 'PERSISTS', '--sev', 'high'], None),
+            ([PYTHON, str(SCRIPT), 'status', str(root)], None),
+        ]
+        for cmd, _ in steps:
+            code, out, err = run(cmd)
+            if code != 0:
+                return False, f'cycle step failed: {" ".join(cmd[2:])}: {err[-200:]}'
+        ledger = (root / 'LEDGER.md').read_text()
+        journal_files = list((root / 'journal').glob('*.md'))
+        chain_files = list((root / 'chains').glob('CHAIN-*.md'))
+        checklist = root / 'retest' / 'round-1' / 'CHECKLIST.md'
+        ok = (
+            'PERSISTS' in ledger
+            and len(journal_files) == 1
+            and len(chain_files) == 1
+            and checklist.is_file()
+        )
+        return ok, 'cycle artifacts verified (journal, chain, checklist, ledger)'
+
+
+def check_seeds():
+    seeds_dir = REPO / 'tools' / 'seeds'
+    if not seeds_dir.is_dir():
+        seeds_dir = REPO / 'engine' / 'seeds'
+    seeds = sorted(seeds_dir.glob('*.js'))
+    if not seeds:
+        return False, 'no seed scripts found'
+    if shutil.which('node') is None:
+        return True, f'{len(seeds)} seeds present (node not installed, syntax skipped)'
+    for seed in seeds:
+        code, out, err = run(['node', '--check', str(seed)])
+        if code != 0:
+            return False, f'node --check failed for {seed.name}: {err[-200:]}'
+    return True, f'{len(seeds)} seed scripts parse with node --check'
+
+
+def check_local():
+    ok1, d1 = check_lint()
+    ok2, d2 = check_index()
+    return (ok1 and ok2), f'lint: {d1} | index: {d2}'
+
+
+CHECKS = [
+    ('lint', check_lint),
+    ('index', check_index),
+    ('scrub', check_scrub),
+    ('scrub-controls', check_scrub_controls),
+    ('cycle', check_cycle),
+    ('seeds-syntax', check_seeds),
+]
+
+CHECKS_LOCAL = [
+    ('lint', check_lint),
+    ('index', check_index),
+    ('scrub-controls', check_scrub_controls),
+    ('cycle', check_cycle),
+    ('seeds-syntax', check_seeds),
+]
+
+
+def cmd_validate(args) -> int:
+    checks = CHECKS_LOCAL if getattr(args, 'local', False) else CHECKS
+    results = []
+    for name, fn in checks:
+        try:
+            ok, detail = fn()
+        except Exception as exc:
+            ok, detail = False, f'exception: {exc}'
+        results.append({'check': name, 'ok': ok, 'detail': detail})
+
+    passed = sum(1 for r in results if r['ok'])
+    total = len(results)
+    overall = passed == total
+
+    if args.json_output:
+        print(json.dumps({'overall': overall, 'passed': passed,
+                          'total': total, 'results': results}, indent=2))
+    else:
+        print('=== MOSRAI validation (repo) ===')
+        print(f'repo: {REPO}')
+        print()
+        for r in results:
+            mark = 'PASS' if r['ok'] else 'FAIL'
+            print(f'  [{mark}] {r["check"]:16} {r["detail"]}')
+        print()
+        print(f'Result: {"PASS" if overall else "FAIL"} '
+              f'({passed}/{total} checks)')
+
+    report = REPO / 'validation-report.md'
+    lines = [
+        '# MOSRAI validation report (repo)',
+        '',
+        f'- Date: {datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}',
+        f'- Repo: `{REPO}`',
+        f'- Overall: **{"PASS" if overall else "FAIL"}** ({passed}/{total})',
+        '',
+        '| Check | Result | Detail |',
+        '|---|---|---|',
+    ]
+    for r in results:
+        mark = 'PASS' if r['ok'] else 'FAIL'
+        detail = r['detail'].replace('|', '\\|').replace('\n', ' ')
+        lines.append(f'| {r["check"]} | {mark} | {detail} |')
+    lines.append('')
+    report.write_text('\n'.join(lines))
+    print(f'report: {report.name}')
+
+    return 0 if overall else 1
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+
+_HELP_TEXT = """MOSRAI: Mobile Offensive Security Research AI Agent
+
+Main flow:
+  init      scaffold an engagement
+  start     launch the harness
+  status    engagement snapshot
+  report    consolidate and distribute
+  matrix    attack surface matrix
+
+During analysis:
+  journal   log a human intervention
+  chain     confirm a kill chain
+  retest    generate a retest checklist
+  ledger    record a verdict
+  scrub     confidentiality gate
+
+Repo/dev:
+  validate  self-test
+  lint      check skills
+  index     rebuild SKILL_INDEX
+  new       scaffold a skill"""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog='mosrai',
+        description='MOSRAI: Mobile Offensive Security Research AI Agent',
+        add_help=True,
+    )
+    sub = parser.add_subparsers(dest='command')
+
+    p = sub.add_parser('init', help='scaffold an engagement')
+    p.add_argument('dir')
+    p.add_argument('--app', default='')
+    p.add_argument('--package', default='')
+    p.add_argument('--platform', default='', choices=['', 'android', 'ios'])
+    p.add_argument('--stack', default='')
+    p.add_argument('--heavy', default='')
+    p.add_argument('--soft', default='')
+    p.add_argument('--intake-tier', dest='intake_tier', default='', choices=['', 'gray-box', 'white-box'])
+    p.add_argument('--artifact', default='')
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser('start', help='launch the harness')
+    p.add_argument('dir', nargs='?', default='.')
+    p.set_defaults(func=cmd_start)
+
+    p = sub.add_parser('status', help='engagement snapshot')
+    p.add_argument('dir')
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser('report', help='consolidate and distribute')
+    p.add_argument('dir', nargs='?', default='.')
+    p.set_defaults(func=cmd_report)
+    p = sub.add_parser('matrix', help='scaffold the attack surface matrix template')
+    p.add_argument('dir', nargs='?', default='.')
+    p.set_defaults(func=cmd_matrix)
+
+
+    p = sub.add_parser('journal', help='log a human intervention')
+    p.add_argument('dir')
+    p.add_argument('--category', type=int, required=True, choices=list(MAP_CATEGORIES))
+    p.add_argument('--finding', default='')
+    p.add_argument('--phase', default='')
+    p.add_argument('--title', default='')
+    p.set_defaults(func=cmd_journal)
+
+    p = sub.add_parser('chain', help='confirm a kill chain')
+    p.add_argument('dir')
+    p.add_argument('--title', default='')
+    p.add_argument('--severity', default='')
+    p.add_argument('--findings', default='')
+    p.set_defaults(func=cmd_chain)
+
+    p = sub.add_parser('retest', help='generate a retest checklist')
+    p.add_argument('dir')
+    p.add_argument('--round', type=int, required=True)
+    p.add_argument('--artifact', default='')
+    p.add_argument('--scope', default='all-open')
+    p.set_defaults(func=cmd_checklist)
+
+    p = sub.add_parser('ledger', help='record a verdict')
+    p.add_argument('dir')
+    p.add_argument('--finding', required=True)
+    p.add_argument('--round', type=int, required=True)
+    p.add_argument('--verdict', required=True)
+    p.add_argument('--note', default='')
+    p.add_argument('--sev', default='')
+    p.add_argument('--maswe', default='')
+    p.set_defaults(func=cmd_ledger)
+
+    p = sub.add_parser('scrub', help='confidentiality gate')
+    p.add_argument('target')
+    p.add_argument('--conf', default=None)
+    p.add_argument('--json', action='store_true', dest='json_output')
+    p.add_argument('--strict', action='store_true')
+    p.set_defaults(func=cmd_scrub)
+
+    p = sub.add_parser('validate', help='self-test')
+    p.add_argument('--json', action='store_true', dest='json_output')
+    p.add_argument('--local', action='store_true')
+    p.set_defaults(func=cmd_validate)
+
+    p = sub.add_parser('lint', help='check skills')
+    p.add_argument('--json', action='store_true', dest='json_output')
+    p.add_argument('--fix', action='store_true')
+    p.set_defaults(func=cmd_lint)
+
+    p = sub.add_parser('index', help='rebuild SKILL_INDEX')
+    p.set_defaults(func=cmd_index)
+
+    p = sub.add_parser('new', help='scaffold a skill')
+    p.add_argument('slug')
+    p.set_defaults(func=cmd_new)
+
+    args = parser.parse_args()
+    if not getattr(args, 'command', None):
+        print(_HELP_TEXT)
+        return 1
+    return args.func(args)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
